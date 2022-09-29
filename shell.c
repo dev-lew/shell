@@ -3,14 +3,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MAX_ARG_LEN 32
 #define MAX_LINE_LEN 512
 
 int count_delimiter(char *, char);
+
+int count_delimiter(char *str, char delimiter) {
+  int result = 0;
+
+  for (char *s = str; *s; s++) {
+    if (*s == delimiter)
+      result++;
+  }
+
+  return result;
+}
 
 /* Wrapper for strtok that returns a dynamically-allocated
    string array
@@ -22,7 +33,7 @@ int count_delimiter(char *, char);
    To fill the string arrays we copy the token to the dynamically
    allocated memory.
 */
-char **split(char *input, const char* delimiter) {
+char **split(char *input, const char *delimiter) {
   char **result =
       malloc(sizeof(char *) * count_delimiter(input, *delimiter) + 2);
   int i = 0;
@@ -37,16 +48,6 @@ char **split(char *input, const char* delimiter) {
   return result;
 }
 
-int count_delimiter(char *str, char delimiter) {
-  int result = 0;
-
-  for (char *s = str; *s; s++) {
-    if (*s == delimiter)
-      result++;
-  }
-
-  return result;
-}
 
 /* Mutates original string */
 char *strip(char *str) {
@@ -109,15 +110,85 @@ char *get_filename(char *executable) {
   }
 }
 
+void print_execute_error(char **argv) {
+  fprintf(stderr, "my_shell: %s: %s\n", get_filename(argv[0]), strerror(errno));
+}
+
+/* Execute a command given argv with stdin and stdout specified
+   by in and out respectively
+
+   This function will not be called when in and out are both
+   STDIN_FILENO and STDOUT_FILENO respectively
+*/
+int piped_execute(int in, int out, char **argv) {
+  pid_t pid;
+  int wstatus;
+
+  fflush(stdout);
+  if ((pid = fork()) > 0) {
+    wait(&wstatus);
+  } else if (pid == 0) {
+    if (in != STDIN_FILENO) {
+      /* We are reading input from a previous process */
+      if (dup2(in, STDIN_FILENO) == -1) {
+        print_execute_error(argv);
+        close(in);
+        return -1;
+      }
+
+      close(in);
+    }
+
+    if (out != STDOUT_FILENO) {
+      /* We are redirecting our output to the next process */
+      if (dup2(out, STDOUT_FILENO) == -1) {
+        print_execute_error(argv);
+        close(out);
+        return -1;
+      };
+
+      close(out);
+    }
+
+    if (execv(argv[0], argv)) {
+      print_execute_error(argv);
+      return -1;
+    }
+  } else {
+    print_execute_error(argv);
+    return -1;
+  }
+
+  return pid;
+}
+
+void restore_input_output(int original_stdin, int original_stdout) {
+  fflush(stdout);
+  dup2(original_stdin, STDIN_FILENO);
+  dup2(original_stdout, STDOUT_FILENO);
+}
+
 void repl(bool suppress_prompt) {
+  /* In the event of an error, restore original in/out */
+  const int ORIGINAL_STDIN = dup(STDIN_FILENO);
+  const int ORIGINAL_STDOUT = dup(STDOUT_FILENO);
+
   while (!feof(stdin)) {
     char cmds[MAX_ARG_LEN] = {0};
     char **cmd_list;
+    int fd[2];
+
+    /* Preserve original stdin */
+    int in = STDIN_FILENO;
+
+    bool last_command = false;
 
     if (!suppress_prompt)
       prompt();
 
     read_cmd(cmds);
+
+    int num_commands = count_delimiter(cmds, '|') + 1;
     /* strcpy(cmds, "/bin/echo -e a\nb\nc | grep b | cat -n"); */
 
     cmd_list = split(cmds, "|");
@@ -128,38 +199,57 @@ void repl(bool suppress_prompt) {
     /*   /\* printf("%zu\n", strlen(*cmd)); *\/ */
     /* } */
 
+    /* If there are 2 or more commands here, they form a pipeline */
     for (char **cmd = cmd_list; *cmd; cmd++) {
       *cmd = strip(*cmd); // overwrite with split string
-
       char **argv = split(*cmd, " ");
-      char executable[strlen(argv[0]) + 1];
-      strcpy(executable, argv[0]);
+      /* char executable[strlen(argv[0]) + 1]; */
+      /* strcpy(executable, argv[0]); */
 
       /* Overwrite possible / form of the executable
          in argv (the new len will be <= to the original) */
-      argv[0] = get_filename(argv[0]);
+      /* argv[0] = get_filename(argv[0]); */
       /* printf("%s\n", argv[0]); */
       /* printf("%s\n", argv[1]); */
       /* printf("%s\n", executable); */
+      pipe(fd);
 
-      pid_t pid;
-      int wstatus;
+      if (!*(cmd + 1))
+        last_command = true;
 
-      fflush(stdout);
-      if ((pid = fork()) > 0) {
-        // Parent process
-        wait(&wstatus);
+      if (!last_command) {
+        if (piped_execute(in, fd[1], argv) == -1) {
+          restore_input_output(ORIGINAL_STDIN, ORIGINAL_STDOUT);
+          break;
+        }
 
-      } else if (pid == 0) {
-        // int estatus;
-        if (execv(executable, argv))
-          printf("my_shell: %s: %s\n", argv[0], strerror(errno));
+        close(fd[1]);
+
+        /* Preserve the read end of the pipe - the previous child's output is
+         * here */
+        in = fd[0];
       } else {
-        // error
-        printf("Error");
+        pid_t pid;
+        int wstatus;
+
+        /* We need one more process to execute the last command */
+        if ((pid = fork()) > 0) {
+          wait(&wstatus);
+
+        } else if (pid == 0) {
+          /* Read output from previous child
+             Note that in this process, stdout is still default (terminal)
+          */
+          if (in != STDIN_FILENO)
+            dup2(in, STDIN_FILENO);
+
+          if (execv(argv[0], argv))
+            print_execute_error(argv);
+
+        } else {
+          print_execute_error(argv);
+        }
       }
-      /* for mini deadline */
-      break;
     }
   }
 }
@@ -174,8 +264,9 @@ int main(int argc, char *argv[]) {
       exit(-1);
     }
   } else {
-      suppress_prompt = false;
+    suppress_prompt = false;
   }
+
   repl(suppress_prompt);
   return 0;
 }
